@@ -1,0 +1,148 @@
+.root {
+    -fx-font-family: "Segoe UI";
+    -fx-font-size: 13px;
+
+    -fx-base: #1e1f22;
+    -fx-background: #1e1f22;
+    -fx-background-color: #1e1f22;
+
+    -fx-control-inner-background: #2b2d31;
+    -fx-text-background-color: #f2f3f5;
+
+    -fx-accent: #5865f2;
+    -fx-focus-color: #5865f2;
+    -fx-faint-focus-color: rgba(88, 101, 242, 0.25);
+}
+
+.label {
+    -fx-text-fill: #f2f3f5;
+}
+
+.check-box {
+    -fx-text-fill: #dbdee1;
+}
+
+.check-box .box {
+    -fx-background-color: #2b2d31;
+    -fx-border-color: #72767d;
+    -fx-border-radius: 3px;
+    -fx-background-radius: 3px;
+}
+
+.check-box:selected .box {
+    -fx-background-color: #5865f2;
+    -fx-border-color: #5865f2;
+}
+
+.check-box:selected .mark {
+    -fx-background-color: white;
+}
+
+.text-field,
+.text-area {
+    -fx-text-fill: #f2f3f5;
+    -fx-prompt-text-fill: #949ba4;
+    -fx-background-color: #111214;
+    -fx-border-color: #3f4147;
+    -fx-border-radius: 4px;
+    -fx-background-radius: 4px;
+}
+
+.text-field:focused,
+.text-area:focused {
+    -fx-border-color: #5865f2;
+}
+
+.text-area .content {
+    -fx-background-color: #111214;
+}
+
+.text-area .scroll-pane,
+.text-area .scroll-pane .viewport {
+    -fx-background-color: transparent;
+}
+
+.button {
+    -fx-text-fill: white;
+    -fx-background-color: #5865f2;
+    -fx-background-radius: 4px;
+    -fx-padding: 7px 14px;
+    -fx-cursor: hand;
+}
+
+.button:hover {
+    -fx-background-color: #4752c4;
+}
+
+.button:pressed {
+    -fx-background-color: #3c45a5;
+}
+
+.button:disabled {
+    -fx-opacity: 0.45;
+}
+
+.separator .line {
+    -fx-border-color: #3f4147;
+    -fx-border-width: 1px 0 0 0;
+}
+
+.scroll-bar {
+    -fx-background-color: #1e1f22;
+}
+
+.scroll-bar .thumb {
+    -fx-background-color: #111214;
+    -fx-background-radius: 6px;
+}
+
+.dialog-pane {
+    -fx-background-color: #1e1f22;
+}
+
+.dialog-pane .label {
+    -fx-text-fill: #f2f3f5;
+}
+
+.dialog-pane .header-panel {
+    -fx-background-color: #2b2d31;
+}
+
+.scroll-pane {
+    -fx-background-color: transparent;
+    -fx-border-color: transparent;
+}
+
+.scroll-pane > .viewport {
+    -fx-background-color: #1e1f22;
+}
+
+.list-view {
+    -fx-background-color: #111214;
+    -fx-border-color: #3f4147;
+    -fx-border-radius: 4px;
+    -fx-background-radius: 4px;
+}
+
+.list-cell {
+    -fx-background-color: #111214;
+    -fx-text-fill: #f2f3f5;
+    -fx-padding: 8px;
+}
+
+.list-cell:filled:hover {
+    -fx-background-color: #232428;
+}
+
+.ticket-row {
+    -fx-padding: 2px 4px;
+}
+
+.button.ticket-complete-button {
+    -fx-background-color: #da373c;
+    -fx-padding: 5px 11px;
+}
+
+.button.ticket-complete-button:hover {
+    -fx-background-color: #a1282d;
+}
