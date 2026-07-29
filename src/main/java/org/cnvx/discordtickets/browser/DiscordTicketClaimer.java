@@ -6,6 +6,9 @@ import com.microsoft.playwright.PlaywrightException;
 import com.microsoft.playwright.options.WaitUntilState;
 import org.cnvx.discordtickets.model.ServerType;
 
+import java.net.URI;
+import java.util.Map;
+import java.util.Objects;
 import java.util.Optional;
 
 public final class DiscordTicketClaimer {
@@ -13,32 +16,210 @@ public final class DiscordTicketClaimer {
     private static final String CHAT_SELECTOR =
             "ol[data-list-id='chat-messages']";
 
-    private static final long CHAT_TIMEOUT_MILLIS = 10_000;
-    private static final long CONFIRMATION_TIMEOUT_MILLIS = 8_000;
-    private static final long POLLING_INTERVAL_MILLIS = 200;
+    private static final long TARGET_CLAIM_UI_TIMEOUT_MILLIS = 2_500;
+
+    private static final double TARGET_CLAIM_UI_POLL_MILLIS = 25;
+
+    private static final String TARGET_CLAIM_UI_SCRIPT = """
+        args => {
+            const expectedSuffix =
+                "/" + args.channelId;
+
+            /*
+             * La URL debe corresponder al canal objetivo.
+             */
+            if (!window.location.pathname.endsWith(
+                    expectedSuffix
+            )) {
+                return false;
+            }
+
+            const chat = document.querySelector(
+                "ol[data-list-id='chat-messages']"
+            );
+
+            if (!chat) {
+                return false;
+            }
+
+            /*
+             * Evita aceptar el chat que pertenecía al canal
+             * anterior mientras Discord actualiza su interfaz.
+             */
+            const messages = Array.from(
+                chat.querySelectorAll(
+                    "li[id^='chat-messages-']"
+                )
+            );
+
+            const fingerprint =
+                messages.length === 0
+                    ? "empty"
+                    : messages.length
+                        + "|"
+                        + messages[0].id
+                        + "|"
+                        + messages[messages.length - 1].id;
+
+            if (
+                args.requireDifferentChat
+                && fingerprint === args.previousFingerprint
+            ) {
+                return false;
+            }
+
+            const chatText = (
+                chat.innerText
+                || chat.textContent
+                || ""
+            );
+
+            /*
+             * El ticket pudo haber sido reclamado mientras
+             * cambiábamos de canal.
+             */
+            const hasConfirmation =
+                /your\\s+ticket\\s+(?:was|has\\s+been)\\s+claimed\\s+by/i
+                    .test(chatText)
+                ||
+                /ticket\\s+has\\s+been\\s+claimed\\s+by/i
+                    .test(chatText);
+
+            if (hasConfirmation) {
+                return true;
+            }
+
+            if (args.server === "SKYBLOCK_MANIACS") {
+                return Boolean(
+                    chat.querySelector(
+                        "button img[data-name='📌'], "
+                            + "button img[alt='📌']"
+                    )
+                );
+            }
+
+            return Array.from(
+                chat.querySelectorAll("button")
+            ).some(button => {
+                const label = (
+                    button.innerText
+                    || button.textContent
+                    || ""
+                )
+                    .replace(/\\s+/g, " ")
+                    .trim()
+                    .toLowerCase();
+
+                return label === "claim"
+                    || label === "✅ claim";
+            });
+        }
+        """;
+
+    private boolean openChannelFast(
+            Page page,
+            ChannelObservation observation
+    ) {
+        String channelSuffix =
+                "/" + observation.channelId();
+
+        if (page.url().endsWith(channelSuffix)) {
+            return true;
+        }
+
+        String channelPath = URI.create(
+                observation.url()
+        ).getPath();
+
+        Object clicked = page.evaluate(
+                """
+                path => {
+                    const links = document.querySelectorAll(
+                        "a[href*='/channels/']"
+                    );
+    
+                    for (const link of links) {
+                        if (link.getAttribute('href') === path) {
+                            link.click();
+                            return true;
+                        }
+                    }
+    
+                    return false;
+                }
+                """,
+                channelPath
+        );
+
+        if (Boolean.TRUE.equals(clicked)) {
+            try {
+                page.waitForURL(
+                        "**/" + observation.channelId(),
+                        new Page.WaitForURLOptions()
+                                .setTimeout(2_000)
+                );
+
+                return true;
+
+            } catch (PlaywrightException ignored) {
+                // Se utiliza el fallback inferior.
+            }
+        }
+
+        page.navigate(
+                observation.url(),
+                new Page.NavigateOptions()
+                        .setWaitUntil(
+                                WaitUntilState.COMMIT
+                        )
+                        .setTimeout(4_000)
+        );
+
+        return page.url().endsWith(channelSuffix);
+    }
 
     public TicketClaimResult claim(
             Page page,
             ChannelObservation observation,
             String configuredUsername
     ) {
-        boolean clickCompleted = false;
 
         try {
-            page.navigate(
-                    observation.url(),
-                    new Page.NavigateOptions()
-                            .setWaitUntil(
-                                    WaitUntilState.DOMCONTENTLOADED
-                            )
-                            .setTimeout(20_000)
-            );
+            boolean channelWasAlreadyOpen =
+                    isCurrentChannel(
+                            page,
+                            observation
+                    );
 
-            if (!waitForChat(page)) {
+            String previousChatFingerprint =
+                    channelWasAlreadyOpen
+                            ? ""
+                            : readChatFingerprint(page);
+
+            if (!openChannelFast(page, observation)) {
                 return new TicketClaimResult(
                         TicketClaimStatus.TECHNICAL_FAILURE,
                         "",
-                        "El canal abrió, pero no apareció el chat."
+                        "No fue posible abrir rápidamente el canal."
+                );
+            }
+
+            boolean targetInterfaceReady =
+                    waitForTargetClaimUi(
+                            page,
+                            observation,
+                            previousChatFingerprint,
+                            !channelWasAlreadyOpen
+                    );
+
+            if (!targetInterfaceReady) {
+                return new TicketClaimResult(
+                        TicketClaimStatus.BUTTON_NOT_FOUND,
+                        "",
+                        "El canal objetivo abrió, pero no apareció "
+                                + "el botón ni una confirmación durante "
+                                + TARGET_CLAIM_UI_TIMEOUT_MILLIS
+                                + " ms."
                 );
             }
 
@@ -84,13 +265,14 @@ public final class DiscordTicketClaimer {
                 );
             }
 
+            long clickStartedAt = System.nanoTime();
+
             try {
                 claimButton.get().click(
                         new Locator.ClickOptions()
-                                .setTimeout(5_000)
+                                .setTimeout(3_000)
                 );
 
-                clickCompleted = true;
             } catch (PlaywrightException exception) {
                 Optional<String> confirmationAfterFailure =
                         findLatestConfirmationText(page);
@@ -109,51 +291,25 @@ public final class DiscordTicketClaimer {
                 );
             }
 
-            return waitForConfirmation(
-                    page,
-                    configuredUsername
+            long clickElapsedMillis =
+                    (System.nanoTime() - clickStartedAt)
+                            / 1_000_000;
+
+            return new TicketClaimResult(
+                    TicketClaimStatus.CLICK_SENT,
+                    "",
+                    "El clic fue enviado en "
+                            + clickElapsedMillis
+                            + " ms."
             );
 
         } catch (PlaywrightException exception) {
-            /*
-             * Si el clic ya terminó, no sabemos con certeza si
-             * Discord procesó la interacción. Por seguridad no
-             * liberaremos posteriormente ese espacio.
-             */
-            if (clickCompleted) {
-                return new TicketClaimResult(
-                        TicketClaimStatus.CONFIRMATION_TIMEOUT,
-                        "",
-                        "El clic terminó, pero hubo un error "
-                                + "al leer la confirmación: "
-                                + exception.getMessage()
-                );
-            }
-
             return new TicketClaimResult(
                     TicketClaimStatus.TECHNICAL_FAILURE,
                     "",
                     exception.getMessage()
             );
         }
-    }
-
-    private boolean waitForChat(Page page) {
-        long deadline =
-                System.currentTimeMillis()
-                        + CHAT_TIMEOUT_MILLIS;
-
-        Locator chat = page.locator(CHAT_SELECTOR);
-
-        while (System.currentTimeMillis() < deadline) {
-            if (chat.count() > 0 && chat.first().isVisible()) {
-                return true;
-            }
-
-            page.waitForTimeout(POLLING_INTERVAL_MILLIS);
-        }
-
-        return false;
     }
 
     private Optional<Locator> findClaimButton(
@@ -174,7 +330,9 @@ public final class DiscordTicketClaimer {
     ) {
         Locator buttons = page.locator(
                 CHAT_SELECTOR
-                        + " button:has(img[data-name='📌'])"
+                        + " button:has(img[data-name='📌']), "
+                        + CHAT_SELECTOR
+                        + " button:has(img[alt='📌'])"
         );
 
         return firstVisibleEnabled(buttons);
@@ -227,38 +385,6 @@ public final class DiscordTicketClaimer {
         }
 
         return Optional.empty();
-    }
-
-    private TicketClaimResult waitForConfirmation(
-            Page page,
-            String configuredUsername
-    ) {
-        long deadline =
-                System.currentTimeMillis()
-                        + CONFIRMATION_TIMEOUT_MILLIS;
-
-        while (System.currentTimeMillis() < deadline) {
-            Optional<String> confirmation =
-                    findLatestConfirmationText(page);
-
-            if (confirmation.isPresent()) {
-                return resultFromConfirmation(
-                        confirmation.get(),
-                        configuredUsername
-                );
-            }
-
-            page.waitForTimeout(POLLING_INTERVAL_MILLIS);
-        }
-
-        return new TicketClaimResult(
-                TicketClaimStatus.CONFIRMATION_TIMEOUT,
-                "",
-                "El clic se realizó, pero Discord no mostró "
-                        + "confirmación durante "
-                        + CONFIRMATION_TIMEOUT_MILLIS
-                        + " ms."
-        );
     }
 
     private Optional<String> findLatestConfirmationText(
@@ -322,5 +448,118 @@ public final class DiscordTicketClaimer {
                 "Discord confirmó que otra persona "
                         + "reclamó el ticket."
         );
+    }
+
+    public Optional<TicketClaimResult>
+    inspectCurrentChannelConfirmation(
+            Page page,
+            String configuredMinecraftUsername
+    ) {
+        Objects.requireNonNull(
+                page,
+                "La página es obligatoria."
+        );
+
+        Objects.requireNonNull(
+                configuredMinecraftUsername,
+                "El nombre de Minecraft es obligatorio."
+        );
+
+        return findLatestConfirmationText(page)
+                .map(confirmationText ->
+                        resultFromConfirmation(
+                                confirmationText,
+                                configuredMinecraftUsername
+                        )
+                );
+    }
+
+    private String readChatFingerprint(Page page) {
+        Object rawFingerprint = page.evaluate(
+                """
+                () => {
+                    const chat = document.querySelector(
+                        "ol[data-list-id='chat-messages']"
+                    );
+    
+                    if (!chat) {
+                        return "";
+                    }
+    
+                    const messages = Array.from(
+                        chat.querySelectorAll(
+                            "li[id^='chat-messages-']"
+                        )
+                    );
+    
+                    if (messages.length === 0) {
+                        return "empty";
+                    }
+    
+                    return messages.length
+                        + "|"
+                        + messages[0].id
+                        + "|"
+                        + messages[messages.length - 1].id;
+                }
+                """
+        );
+
+        return Objects.toString(
+                rawFingerprint,
+                ""
+        );
+    }
+
+    private boolean isCurrentChannel(
+            Page page,
+            ChannelObservation observation
+    ) {
+        String path = URI.create(
+                page.url()
+        ).getPath();
+
+        return path != null
+                && path.endsWith(
+                "/" + observation.channelId()
+        );
+    }
+
+    private boolean waitForTargetClaimUi(
+            Page page,
+            ChannelObservation observation,
+            String previousChatFingerprint,
+            boolean requireDifferentChat
+    ) {
+        try {
+            page.waitForFunction(
+                    TARGET_CLAIM_UI_SCRIPT,
+                    Map.of(
+                            "channelId",
+                            observation.channelId(),
+
+                            "server",
+                            observation.server().name(),
+
+                            "previousFingerprint",
+                            previousChatFingerprint,
+
+                            "requireDifferentChat",
+                            requireDifferentChat
+                    ),
+                    new Page.WaitForFunctionOptions()
+                            .setTimeout(
+                                    TARGET_CLAIM_UI_TIMEOUT_MILLIS
+                            )
+                            .setPollingInterval(
+                                    TARGET_CLAIM_UI_POLL_MILLIS
+                            )
+            );
+
+            return true;
+
+        } catch (PlaywrightException exception) {
+            return false;
+        }
     }
 }

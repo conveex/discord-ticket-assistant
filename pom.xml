@@ -11,9 +11,20 @@
     <name>Discord Ticket Assistant</name>
 
     <properties>
+        <app.mainClass>org.cnvx.discordtickets.MainLauncher</app.mainClass>
+        <app.name>CarryAssistant</app.name>
+        <app.version>1.0.0</app.version>
+        <app.vendor>convex</app.vendor>
+        <app.packageInput>${project.build.directory}/package-input</app.packageInput>
+        <app.packageOutput>${project.build.directory}/package-output</app.packageOutput>
         <maven.compiler.source>21</maven.compiler.source>
         <maven.compiler.target>21</maven.compiler.target>
         <project.build.sourceEncoding>UTF-8</project.build.sourceEncoding>
+
+        <app.installerOutput>${project.build.directory}/installer-output</app.installerOutput>
+        <app.upgradeUuid>017aa6c2-8953-414f-9bfe-db912f82ea71</app.upgradeUuid>
+
+        <jna.version>5.19.1</jna.version>
 
         <javafx.version>21.0.8</javafx.version>
         <playwright.version>1.60.0</playwright.version>
@@ -42,6 +53,12 @@
             <artifactId>junit-jupiter</artifactId>
             <version>${junit.version}</version>
             <scope>test</scope>
+        </dependency>
+
+        <dependency>
+            <groupId>net.java.dev.jna</groupId>
+            <artifactId>jna</artifactId>
+            <version>${jna.version}</version>
         </dependency>
 
     </dependencies>
@@ -78,4 +95,244 @@
         </plugins>
     </build>
 
+    <profiles>
+        <profile>
+            <id>windows-app-image</id>
+
+            <build>
+                <plugins>
+
+                    <!--
+                        Limpia los directorios de empaquetado y después
+                        copia el JAR generado por nuestro proyecto.
+                    -->
+                    <plugin>
+                        <groupId>org.apache.maven.plugins</groupId>
+                        <artifactId>maven-antrun-plugin</artifactId>
+                        <version>3.2.0</version>
+
+                        <executions>
+                            <execution>
+                                <id>clean-jpackage-directories</id>
+                                <phase>initialize</phase>
+
+                                <goals>
+                                    <goal>run</goal>
+                                </goals>
+
+                                <configuration>
+                                    <target>
+                                        <delete
+                                                dir="${app.packageInput}"
+                                                quiet="true"
+                                        />
+
+                                        <delete
+                                                dir="${app.packageOutput}"
+                                                quiet="true"
+                                        />
+
+                                        <delete
+                                                dir="${app.installerOutput}"
+                                                quiet="true"
+                                        />
+
+                                        <mkdir
+                                                dir="${app.packageInput}"
+                                        />
+
+                                        <mkdir
+                                                dir="${app.packageOutput}"
+                                        />
+
+                                        <mkdir
+                                                dir="${app.installerOutput}"
+                                        />
+                                    </target>
+                                </configuration>
+                            </execution>
+
+                            <execution>
+                                <id>copy-main-application-jar</id>
+                                <phase>verify</phase>
+
+                                <goals>
+                                    <goal>run</goal>
+                                </goals>
+
+                                <configuration>
+                                    <target>
+                                        <copy
+                                                file="${project.build.directory}/${project.build.finalName}.jar"
+                                                todir="${app.packageInput}"
+                                                overwrite="true"
+                                        />
+                                    </target>
+                                </configuration>
+                            </execution>
+                        </executions>
+                    </plugin>
+
+                    <!--
+                        Copia JavaFX, Playwright y todas las demás
+                        dependencias transitivas.
+                    -->
+                    <plugin>
+                        <groupId>org.apache.maven.plugins</groupId>
+                        <artifactId>maven-dependency-plugin</artifactId>
+                        <version>3.11.0</version>
+
+                        <executions>
+                            <execution>
+                                <id>copy-runtime-dependencies</id>
+                                <phase>prepare-package</phase>
+
+                                <goals>
+                                    <goal>copy-dependencies</goal>
+                                </goals>
+
+                                <configuration>
+                                    <includeScope>runtime</includeScope>
+
+                                    <outputDirectory>
+                                        ${app.packageInput}
+                                    </outputDirectory>
+                                </configuration>
+                            </execution>
+                        </executions>
+                    </plugin>
+
+                    <!--
+                        Ejecuta jpackage desde el mismo JDK que utiliza Maven.
+                    -->
+                    <plugin>
+                        <groupId>org.codehaus.mojo</groupId>
+                        <artifactId>exec-maven-plugin</artifactId>
+                        <version>3.6.3</version>
+
+                        <executions>
+                            <execution>
+                                <id>create-windows-app-image</id>
+                                <phase>verify</phase>
+
+                                <goals>
+                                    <goal>exec</goal>
+                                </goals>
+
+                                <configuration>
+                                    <executable>
+                                        ${java.home}/bin/jpackage.exe
+                                    </executable>
+
+                                    <arguments>
+                                        <argument>--type</argument>
+                                        <argument>app-image</argument>
+
+                                        <argument>--dest</argument>
+                                        <argument>${app.packageOutput}</argument>
+
+                                        <argument>--input</argument>
+                                        <argument>${app.packageInput}</argument>
+
+                                        <argument>--name</argument>
+                                        <argument>${app.name}</argument>
+
+                                        <argument>--main-jar</argument>
+                                        <argument>${project.build.finalName}.jar</argument>
+
+                                        <argument>--main-class</argument>
+                                        <argument>${app.mainClass}</argument>
+
+                                        <argument>--app-version</argument>
+                                        <argument>${app.version}</argument>
+
+                                        <argument>--vendor</argument>
+                                        <argument>${app.vendor}</argument>
+
+                                        <argument>--description</argument>
+                                        <argument>Asistente de vigilancia y gestión de carries</argument>
+
+                                        <argument>--icon</argument>
+                                        <argument>${project.basedir}/src/main/resources/packaging/icon.ico</argument>
+
+                                        <argument>--java-options</argument>
+                                        <argument>-Dfile.encoding=UTF-8</argument>
+
+                                        <argument>--verbose</argument>
+                                    </arguments>
+                                </configuration>
+                            </execution>
+                            <execution>
+                                <id>create-windows-installer</id>
+
+                                <!--
+                                    La imagen autónoma se genera en verify.
+                                    El instalador se genera después, durante install.
+                                -->
+                                <phase>install</phase>
+
+                                <goals>
+                                    <goal>exec</goal>
+                                </goals>
+
+                                <configuration>
+                                    <executable>
+                                        ${java.home}/bin/jpackage.exe
+                                    </executable>
+
+                                    <arguments>
+                                        <argument>--type</argument>
+                                        <argument>exe</argument>
+
+                                        <argument>--dest</argument>
+                                        <argument>${app.installerOutput}</argument>
+
+                                        <argument>--name</argument>
+                                        <argument>${app.name}</argument>
+
+                                        <argument>--app-image</argument>
+                                        <argument>${app.packageOutput}/${app.name}</argument>
+
+                                        <argument>--app-version</argument>
+                                        <argument>${app.version}</argument>
+
+                                        <argument>--vendor</argument>
+                                        <argument>${app.vendor}</argument>
+
+                                        <argument>--description</argument>
+                                        <argument>Asistente de vigilancia y gestión de carries</argument>
+
+                                        <argument>--icon</argument>
+                                        <argument>${project.basedir}/src/main/resources/packaging/icon.ico</argument>
+
+                                        <!-- Instalar únicamente para el usuario actual. -->
+                                        <argument>--win-per-user-install</argument>
+
+                                        <!-- Permitir elegir la ubicación de instalación. -->
+                                        <argument>--win-dir-chooser</argument>
+
+                                        <!-- Crear acceso directo en el menú Inicio. -->
+                                        <argument>--win-menu</argument>
+
+                                        <argument>--win-menu-group</argument>
+                                        <argument>Carry Assistant</argument>
+
+                                        <!-- Crear acceso directo en el escritorio. -->
+                                        <argument>--win-shortcut</argument>
+
+                                        <!-- Identificador estable para futuras actualizaciones. -->
+                                        <argument>--win-upgrade-uuid</argument>
+                                        <argument>${app.upgradeUuid}</argument>
+
+                                        <argument>--verbose</argument>
+                                    </arguments>
+                                </configuration>
+                            </execution>
+                        </executions>
+                    </plugin>
+
+                </plugins>
+            </build>
+        </profile>
+    </profiles>
 </project>

@@ -3,6 +3,12 @@ package org.cnvx.discordtickets.browser;
 public enum TicketClaimStatus {
 
     /**
+     * El clic se envió correctamente, pero la confirmación
+     * todavía no ha sido comprobada.
+     */
+    CLICK_SENT,
+
+    /**
      * Discord confirmó que el usuario configurado reclamó el ticket.
      */
     CLAIMED_BY_US,

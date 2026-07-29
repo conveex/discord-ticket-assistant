@@ -6,9 +6,7 @@ import javafx.scene.control.*;
 import javafx.scene.image.Image;
 import javafx.scene.layout.*;
 import javafx.stage.Screen;
-import org.cnvx.discordtickets.browser.BrowserAutomationService;
-import org.cnvx.discordtickets.browser.ChannelObservation;
-import org.cnvx.discordtickets.browser.TicketClaimResult;
+import org.cnvx.discordtickets.browser.*;
 import org.cnvx.discordtickets.config.DiscordUrls;
 import org.cnvx.discordtickets.config.MonitoringConfiguration;
 import org.cnvx.discordtickets.model.ServerType;
@@ -24,6 +22,8 @@ import org.cnvx.discordtickets.monitoring.DiscordMonitoringLoop;
 import org.cnvx.discordtickets.monitoring.TicketDiscoveryTracker;
 import org.cnvx.discordtickets.persistence.PersistedTicketState;
 import org.cnvx.discordtickets.persistence.TicketStateStore;
+import org.cnvx.discordtickets.desktop.DesktopTrayManager;
+import org.cnvx.discordtickets.desktop.WindowsSystemAwakeController;
 import javafx.application.Application;
 import javafx.application.Platform;
 import javafx.collections.FXCollections;
@@ -35,6 +35,8 @@ import javafx.scene.control.ButtonBar;
 import javafx.scene.control.ButtonType;
 
 import java.util.Optional;
+import java.util.concurrent.CompletableFuture;
+import java.util.concurrent.TimeUnit;
 import java.util.stream.Stream;
 import java.util.HashMap;
 import java.util.HashSet;
@@ -102,6 +104,31 @@ public final class TicketAssistantApp extends Application {
 
     private String lastPersistenceError;
 
+    private Stage primaryStage;
+
+    private DesktopTrayManager trayManager;
+    private WindowsSystemAwakeController awakeController;
+
+    private Label sleepProtectionLabel;
+
+    private Button stopButton;
+
+    private boolean trayMinimizeMessageShown;
+
+    private BrowserConnectionState lastBrowserConnectionState;
+    private String lastBrowserStatusDetail;
+
+    private static final DateTimeFormatter LOG_TIME_FORMAT =
+            DateTimeFormatter.ofPattern("HH:mm:ss.SSS");
+
+    private static final long CLAIM_CONFIRMATION_TIMEOUT_NANOS =
+            Duration.ofSeconds(8).toNanos();
+
+    private static final long CLAIM_CONFIRMATION_POLL_MILLIS =
+            150;
+
+    private TicketId claimInProgressId;
+
     /*
      * Tickets que llegaron después de la línea base y, por tanto,
      * pueden ser procesados.
@@ -129,13 +156,30 @@ public final class TicketAssistantApp extends Application {
 
     @Override
     public void start(Stage stage) {
-        browserService = new BrowserAutomationService();
+        Platform.setImplicitExit(false);
+
+        primaryStage = stage;
+
+        awakeController =
+                new WindowsSystemAwakeController();
+
+        trayManager =
+                new DesktopTrayManager();
+
+        browserService =
+                new BrowserAutomationService();
+
+        browserService.setStatusListener(event ->
+                Platform.runLater(() ->
+                        handleBrowserStatusEvent(event)
+                )
+        );
 
         ticketStateStore = TicketStateStore.defaultStore();
 
         monitoringLoop = new DiscordMonitoringLoop(
                 browserService::inspectMentionedTickets,
-                Duration.ofSeconds(1)
+                Duration.ofMillis(250)
         );
 
         Label title = new Label("Auto-aceptador de Carries");
@@ -153,11 +197,16 @@ public final class TicketAssistantApp extends Application {
         automaticMonitorLabel =
                 new Label("Monitor automático: DETENIDO");
 
+        sleepProtectionLabel = new Label(
+                "Protección contra suspensión: INACTIVA"
+        );
+
         VBox statusSection = new VBox(
                 5,
                 browserStatusLabel,
                 monitoringStatusLabel,
                 automaticMonitorLabel,
+                sleepProtectionLabel,
                 occupancyLabel,
                 lockedCategoryLabel
         );
@@ -218,11 +267,18 @@ public final class TicketAssistantApp extends Application {
         resumeButton.setDisable(true);
         resumeButton.setOnAction(event -> resumeMonitoring());
 
+        stopButton = new Button("Detener vigilancia");
+        stopButton.setDisable(true);
+        stopButton.setOnAction(
+                event -> stopMonitoring()
+        );
+
         HBox monitoringButtons = new HBox(
                 10,
                 startButton,
                 pauseButton,
-                resumeButton
+                resumeButton,
+                stopButton
         );
 
         activeTicketsListView = new ListView<>(activeTicketItems);
@@ -380,6 +436,8 @@ public final class TicketAssistantApp extends Application {
         stage.show();
         stage.centerOnScreen();
 
+        configureWindowAndSystemTray(stage);
+
         refreshCoordinatorView();
         restorePersistedStateIfPresent();
         openDiscordBrowser();
@@ -390,12 +448,16 @@ public final class TicketAssistantApp extends Application {
 
         try {
             urls = DiscordUrls.load();
+
         } catch (RuntimeException exception) {
             browserStatusLabel.setText(
                     "Navegador: configuración incompleta"
             );
 
-            appendLog("ERROR: " + exception.getMessage());
+            appendLog(
+                    "ERROR: " + exception.getMessage()
+            );
+
             return;
         }
 
@@ -405,40 +467,7 @@ public final class TicketAssistantApp extends Application {
         );
 
         browserService.open(urls.asList())
-                .whenComplete((ignored, error) ->
-                        Platform.runLater(() -> {
-                            if (error == null) {
-                                browserReady = true;
-
-                                browserStatusLabel.setText(
-                                        "Navegador: abierto"
-                                );
-
-                                startButton.setDisable(false);
-
-                                appendLog(
-                                        "Chrome abrió las dos pestañas "
-                                                + "correctamente."
-                                );
-                            } else {
-                                browserReady = false;
-
-                                browserStatusLabel.setText(
-                                        "Navegador: error"
-                                );
-
-                                Throwable cause =
-                                        error.getCause() != null
-                                                ? error.getCause()
-                                                : error;
-
-                                appendLog(
-                                        "ERROR AL ABRIR CHROME: "
-                                                + cause.getMessage()
-                                );
-                            }
-                        })
-                );
+                .exceptionally(error -> null);
     }
 
     private void startMonitoring() {
@@ -483,6 +512,8 @@ public final class TicketAssistantApp extends Application {
                 this::handleAutomaticInspectionError
         );
 
+        activateSleepProtection();
+
         automaticMonitorLabel.setText(
                 "Monitor automático: ACTIVO"
         );
@@ -492,6 +523,7 @@ public final class TicketAssistantApp extends Application {
         startButton.setDisable(true);
         pauseButton.setDisable(false);
         resumeButton.setDisable(true);
+        stopButton.setDisable(false);
 
         appendLog(
                 "Vigilancia iniciada para el jugador: "
@@ -524,12 +556,14 @@ public final class TicketAssistantApp extends Application {
         }
 
         refreshCoordinatorView();
+        updateTrayMonitoringState();
     }
 
     private void pauseMonitoring() {
         coordinator.pause();
 
         monitoringLoop.pause();
+        releaseSleepProtection();
 
         automaticMonitorLabel.setText(
                 "Monitor automático: PAUSADO"
@@ -537,10 +571,12 @@ public final class TicketAssistantApp extends Application {
 
         pauseButton.setDisable(true);
         resumeButton.setDisable(false);
+        stopButton.setDisable(false);
 
         appendLog("Vigilancia pausada.");
 
         refreshCoordinatorView();
+        updateTrayMonitoringState();
     }
 
     private void resumeMonitoring() {
@@ -554,6 +590,7 @@ public final class TicketAssistantApp extends Application {
         coordinator.resume();
 
         monitoringLoop.resume();
+        activateSleepProtection();
 
         automaticMonitorLabel.setText(
                 "Monitor automático: ACTIVO"
@@ -561,10 +598,12 @@ public final class TicketAssistantApp extends Application {
 
         pauseButton.setDisable(false);
         resumeButton.setDisable(true);
+        stopButton.setDisable(false);
 
         appendLog("Vigilancia reanudada.");
 
         refreshCoordinatorView();
+        updateTrayMonitoringState();
     }
 
     private MonitoringConfiguration readConfigurationFromForm() {
@@ -729,8 +768,16 @@ public final class TicketAssistantApp extends Application {
     }
 
     private void appendLog(String message) {
+        String timestamp = LocalTime.now().format(
+                LOG_TIME_FORMAT
+        );
+
         logArea.appendText(
-                message + System.lineSeparator()
+                "["
+                        + timestamp
+                        + "] "
+                        + message
+                        + System.lineSeparator()
         );
     }
 
@@ -852,6 +899,10 @@ public final class TicketAssistantApp extends Application {
     private void tryStartAutomaticClaim(
             ChannelObservation observation
     ) {
+        if (claimInProgressId != null) {
+            return;
+        }
+
         if (!monitoringConfiguration.acceptsServer(
                 observation.server()
         )) {
@@ -878,10 +929,19 @@ public final class TicketAssistantApp extends Application {
 
         switch (reservation.decision()) {
             case RESERVED -> {
+
                 waitingDecisionByTicket.remove(ticketId);
 
+                claimInProgressId = ticketId;
+
+                long claimStartedAtNanos =
+                        System.nanoTime();
+
+                String minecraftUsername =
+                        monitoringConfiguration.minecraftUsername();
+
                 appendLog(
-                        "Espacio reservado; intentando reclamar: "
+                        "Turno bloqueado; enviando reclamación: "
                                 + ticketSummary(observation)
                 );
 
@@ -891,11 +951,14 @@ public final class TicketAssistantApp extends Application {
 
                 browserService.claimTicket(
                         observation,
-                        monitoringConfiguration.minecraftUsername()
+                        minecraftUsername
                 ).whenComplete((claimResult, error) ->
                         Platform.runLater(() ->
-                                finishAutomaticClaim(
+                                finishAutomaticClaimAttempt(
                                         ticket,
+                                        observation,
+                                        minecraftUsername,
+                                        claimStartedAtNanos,
                                         claimResult,
                                         error
                                 )
@@ -955,129 +1018,6 @@ public final class TicketAssistantApp extends Application {
                 // No se registran otros estados aquí.
             }
         }
-    }
-
-    private void finishAutomaticClaim(
-            TicketCandidate ticket,
-            TicketClaimResult claimResult,
-            Throwable error
-    ) {
-        waitingDecisionByTicket.remove(ticket.id());
-
-        if (error != null) {
-            coordinator.cancelReservation(ticket.id());
-
-            temporarilyFailedTicketIds.add(ticket.id());
-
-            appendLog(
-                    "ERROR AL RECLAMAR "
-                            + ticket.channelName()
-                            + ": "
-                            + readableError(error)
-            );
-
-            refreshCoordinatorView();
-            persistCurrentState();
-            return;
-        }
-
-        if (claimResult == null) {
-            coordinator.cancelReservation(ticket.id());
-
-            temporarilyFailedTicketIds.add(ticket.id());
-
-            appendLog(
-                    "ERROR: la reclamación devolvió un resultado vacío: "
-                            + ticket.channelName()
-            );
-
-            refreshCoordinatorView();
-            persistCurrentState();
-            return;
-        }
-
-        switch (claimResult.status()) {
-            case CLAIMED_BY_US -> {
-                boolean confirmed =
-                        coordinator.confirmReservation(
-                                ticket.id()
-                        );
-
-                if (confirmed) {
-                    appendLog(
-                            "TICKET RECLAMADO CORRECTAMENTE: "
-                                    + ticket.channelName()
-                                    + " | reclamante: "
-                                    + claimResult.claimedBy()
-                    );
-                } else {
-                    appendLog(
-                            "Discord confirmó el ticket, pero la reserva "
-                                    + "ya no existía: "
-                                    + ticket.channelName()
-                    );
-                }
-            }
-
-            case CLAIMED_BY_OTHER -> {
-                coordinator.markClaimedByOther(
-                        ticket.id()
-                );
-
-                appendLog(
-                        "Ticket reclamado por otra persona: "
-                                + ticket.channelName()
-                                + " | reclamante: "
-                                + claimResult.claimedBy()
-                );
-            }
-
-            case BUTTON_NOT_FOUND,
-                 CLICK_FAILED,
-                 TECHNICAL_FAILURE -> {
-                coordinator.cancelReservation(
-                        ticket.id()
-                );
-
-                temporarilyFailedTicketIds.add(
-                        ticket.id()
-                );
-
-                appendLog(
-                        "No fue posible reclamar "
-                                + ticket.channelName()
-                                + ": "
-                                + claimResult.detail()
-                );
-            }
-
-            case CONFIRMATION_TIMEOUT -> {
-                /*
-                 * El clic sí se envió. Liberar el espacio podría provocar
-                 * que terminemos con cuatro tickets si Discord sí aceptó
-                 * la reclamación.
-                 *
-                 * Por seguridad se registra como activo incierto.
-                 */
-                boolean registered =
-                        coordinator.confirmReservation(
-                                ticket.id()
-                        );
-
-                if (registered) {
-                    appendLog(
-                            "ADVERTENCIA: se hizo clic en "
-                                    + ticket.channelName()
-                                    + ", pero no apareció confirmación. "
-                                    + "Se registró como activo por seguridad; "
-                                    + "verifícalo manualmente."
-                    );
-                }
-            }
-        }
-
-        refreshCoordinatorView();
-        persistCurrentState();
     }
 
     private TicketId ticketIdOf(
@@ -1414,11 +1354,692 @@ public final class TicketAssistantApp extends Application {
         }
     }
 
+    private void configureWindowAndSystemTray(
+            Stage stage
+    ) {
+        boolean trayInstalled;
+
+        try {
+            trayInstalled = trayManager.install(
+                    () -> Platform.runLater(
+                            this::showMainWindow
+                    ),
+                    () -> Platform.runLater(
+                            this::togglePauseResumeFromTray
+                    ),
+                    () -> Platform.runLater(
+                            this::stopMonitoring
+                    ),
+                    () -> Platform.runLater(
+                            Platform::exit
+                    )
+            );
+
+        } catch (RuntimeException exception) {
+            trayInstalled = false;
+
+            appendLog(
+                    "No fue posible iniciar la bandeja del sistema: "
+                            + exception.getMessage()
+            );
+        }
+
+        if (trayInstalled) {
+            appendLog(
+                    "Icono agregado a la bandeja del sistema."
+            );
+
+            stage.iconifiedProperty().addListener(
+                    (observable, previous, iconified) -> {
+                        if (!iconified) {
+                            return;
+                        }
+
+                        Platform.runLater(() -> {
+                            stage.setIconified(false);
+                            stage.hide();
+
+                            if (!trayMinimizeMessageShown) {
+                                trayMinimizeMessageShown = true;
+
+                                trayManager.showInformation(
+                                        "CarryAssistant sigue activo",
+                                        "La vigilancia continuará en "
+                                                + "segundo plano."
+                                );
+                            }
+                        });
+                    }
+            );
+
+        } else {
+            appendLog(
+                    "La bandeja del sistema no está disponible. "
+                            + "La ventana se minimizará normalmente."
+            );
+        }
+
+        /*
+         * Cerrar con X sí termina completamente la aplicación.
+         * Ocultar/minimizar no lo hace.
+         */
+        stage.setOnCloseRequest(event -> {
+            event.consume();
+            Platform.exit();
+        });
+
+        updateTrayMonitoringState();
+    }
+
+    private void showMainWindow() {
+        primaryStage.show();
+        primaryStage.setIconified(false);
+        primaryStage.toFront();
+        primaryStage.requestFocus();
+    }
+
+    private void togglePauseResumeFromTray() {
+        if (monitoringConfiguration == null) {
+            return;
+        }
+
+        if (coordinator.isPaused()) {
+            resumeMonitoring();
+        } else {
+            pauseMonitoring();
+        }
+    }
+
+    private void updateTrayMonitoringState() {
+        boolean started =
+                monitoringConfiguration != null;
+
+        boolean paused =
+                started && coordinator.isPaused();
+
+        trayManager.updateMonitoringState(
+                started,
+                paused
+        );
+    }
+
+    private void activateSleepProtection() {
+        try {
+            awakeController.activate();
+
+            sleepProtectionLabel.setText(
+                    "Protección contra suspensión: ACTIVA "
+                            + "· la pantalla puede apagarse"
+            );
+
+            appendLog(
+                    "Windows permanecerá despierto mientras "
+                            + "la vigilancia esté activa."
+            );
+
+        } catch (RuntimeException exception) {
+            sleepProtectionLabel.setText(
+                    "Protección contra suspensión: ERROR"
+            );
+
+            appendLog(
+                    "ERROR AL ACTIVAR PROTECCIÓN CONTRA SUSPENSIÓN: "
+                            + exception.getMessage()
+            );
+
+            trayManager.showWarning(
+                    "Protección contra suspensión",
+                    "No fue posible impedir la suspensión automática."
+            );
+        }
+    }
+
+    private void releaseSleepProtection() {
+        try {
+            awakeController.release();
+
+            sleepProtectionLabel.setText(
+                    "Protección contra suspensión: INACTIVA"
+            );
+
+        } catch (RuntimeException exception) {
+            sleepProtectionLabel.setText(
+                    "Protección contra suspensión: ERROR AL LIBERAR"
+            );
+
+            appendLog(
+                    "ERROR AL LIBERAR PROTECCIÓN CONTRA SUSPENSIÓN: "
+                            + exception.getMessage()
+            );
+        }
+    }
+
+    private void stopMonitoring() {
+        if (monitoringConfiguration == null) {
+            return;
+        }
+
+        coordinator.pause();
+        monitoringLoop.pause();
+
+        releaseSleepProtection();
+
+        /*
+         * Se termina la sesión de vigilancia, pero no se eliminan
+         * los tickets activos ni la categoría bloqueada.
+         */
+        monitoringConfiguration = null;
+
+        eligibleTicketIds.clear();
+        waitingDecisionByTicket.clear();
+        temporarilyFailedTicketIds.clear();
+
+        setConfigurationControlsDisabled(false);
+
+        startButton.setDisable(!browserReady);
+        pauseButton.setDisable(true);
+        resumeButton.setDisable(true);
+        stopButton.setDisable(true);
+
+        automaticMonitorLabel.setText(
+                "Monitor automático: DETENIDO"
+        );
+
+        appendLog(
+                "Vigilancia detenida. La configuración puede modificarse."
+        );
+
+        CoordinatorSnapshot snapshot =
+                coordinator.snapshot();
+
+        if (snapshot.occupiedSlots() > 0) {
+            appendLog(
+                    "Los "
+                            + snapshot.occupiedSlots()
+                            + " tickets ocupados se conservaron. "
+                            + "Categoría bloqueada: "
+                            + displayCategory(
+                            snapshot.lockedCategory()
+                    )
+            );
+        }
+
+        refreshCoordinatorView();
+        persistCurrentState();
+        updateTrayMonitoringState();
+    }
+
+    private void handleBrowserStatusEvent(
+            BrowserStatusEvent event
+    ) {
+        BrowserConnectionState previousState =
+                lastBrowserConnectionState;
+
+        String previousDetail =
+                lastBrowserStatusDetail == null
+                        ? ""
+                        : lastBrowserStatusDetail;
+
+        lastBrowserConnectionState =
+                event.state();
+
+        lastBrowserStatusDetail =
+                event.detail();
+
+        switch (event.state()) {
+            case STARTING -> {
+                browserReady = false;
+
+                browserStatusLabel.setText(
+                        "Navegador: INICIANDO"
+                );
+
+                if (monitoringConfiguration == null) {
+                    startButton.setDisable(true);
+                }
+            }
+
+            case READY -> {
+                browserReady = true;
+
+                browserStatusLabel.setText(
+                        "Navegador: ABIERTO"
+                );
+
+                if (monitoringConfiguration == null) {
+                    startButton.setDisable(false);
+                }
+
+                if (previousState
+                        == BrowserConnectionState.RECOVERING
+                        || previousState
+                        == BrowserConnectionState.ERROR) {
+
+                    appendLog(event.detail());
+
+                    trayManager.showInformation(
+                            "Chrome recuperado",
+                            "La vigilancia automática puede continuar."
+                    );
+                }
+            }
+
+            case RECOVERING -> {
+                browserReady = false;
+
+                browserStatusLabel.setText(
+                        "Navegador: RECUPERANDO"
+                );
+
+                logBrowserStatusOnce(
+                        event,
+                        previousState,
+                        previousDetail
+                );
+            }
+
+            case ERROR -> {
+                browserReady = false;
+
+                browserStatusLabel.setText(
+                        "Navegador: ERROR"
+                );
+
+                if (monitoringConfiguration == null) {
+                    startButton.setDisable(true);
+                }
+
+                logBrowserStatusOnce(
+                        event,
+                        previousState,
+                        previousDetail
+                );
+
+                trayManager.showWarning(
+                        "Problema con Chrome",
+                        "CarryAssistant intentará abrirlo nuevamente."
+                );
+            }
+
+            case CLOSED -> {
+                browserReady = false;
+
+                browserStatusLabel.setText(
+                        "Navegador: CERRADO"
+                );
+
+                if (monitoringConfiguration == null) {
+                    startButton.setDisable(true);
+                }
+            }
+        }
+    }
+
+    private void logBrowserStatusOnce(
+            BrowserStatusEvent event,
+            BrowserConnectionState previousState,
+            String previousDetail
+    ) {
+        if (event.state() == previousState
+                && event.detail().equals(previousDetail)) {
+            return;
+        }
+
+        appendLog(
+                "NAVEGADOR "
+                        + event.state()
+                        + ": "
+                        + event.detail()
+        );
+    }
+
+    private void finishAutomaticClaimAttempt(
+            TicketCandidate ticket,
+            ChannelObservation observation,
+            String minecraftUsername,
+            long claimStartedAtNanos,
+            TicketClaimResult claimResult,
+            Throwable error
+    ) {
+        long elapsedMillis =
+                (System.nanoTime() - claimStartedAtNanos)
+                        / 1_000_000;
+
+        if (error != null) {
+            coordinator.cancelReservation(ticket.id());
+
+            temporarilyFailedTicketIds.add(ticket.id());
+
+            clearClaimInProgress(ticket.id());
+
+            appendLog(
+                    "ERROR ANTES DE COMPLETAR EL CLIC EN "
+                            + ticket.channelName()
+                            + " después de "
+                            + elapsedMillis
+                            + " ms: "
+                            + readableError(error)
+            );
+
+            refreshCoordinatorView();
+            persistCurrentState();
+            return;
+        }
+
+        if (claimResult == null) {
+            coordinator.cancelReservation(ticket.id());
+
+            temporarilyFailedTicketIds.add(ticket.id());
+
+            clearClaimInProgress(ticket.id());
+
+            appendLog(
+                    "La reclamación devolvió un resultado vacío: "
+                            + ticket.channelName()
+            );
+
+            refreshCoordinatorView();
+            persistCurrentState();
+            return;
+        }
+
+        switch (claimResult.status()) {
+            case CLICK_SENT -> {
+                appendLog(
+                        "CLIC ENVIADO: "
+                                + ticket.channelName()
+                                + " | tiempo desde la reserva: "
+                                + elapsedMillis
+                                + " ms"
+                );
+
+                /*
+                 * La reserva continúa ocupando un espacio mientras
+                 * buscamos la confirmación.
+                 */
+                refreshCoordinatorView();
+                persistCurrentState();
+
+                long confirmationDeadline =
+                        System.nanoTime()
+                                + CLAIM_CONFIRMATION_TIMEOUT_NANOS;
+
+                scheduleClaimConfirmationInspection(
+                        ticket,
+                        observation,
+                        minecraftUsername,
+                        confirmationDeadline
+                );
+            }
+
+            case CLAIMED_BY_US -> {
+                /*
+                 * Puede ocurrir cuando la confirmación ya estaba
+                 * presente antes de intentar el clic.
+                 */
+                coordinator.confirmReservation(ticket.id());
+
+                clearClaimInProgress(ticket.id());
+
+                appendLog(
+                        "TICKET RECLAMADO CORRECTAMENTE: "
+                                + ticket.channelName()
+                                + " | reclamante: "
+                                + claimResult.claimedBy()
+                );
+
+                refreshCoordinatorView();
+                persistCurrentState();
+            }
+
+            case CLAIMED_BY_OTHER -> {
+                coordinator.markClaimedByOther(ticket.id());
+
+                clearClaimInProgress(ticket.id());
+
+                appendLog(
+                        "Ticket reclamado por otra persona: "
+                                + ticket.channelName()
+                                + " | reclamante: "
+                                + claimResult.claimedBy()
+                );
+
+                refreshCoordinatorView();
+                persistCurrentState();
+            }
+
+            case BUTTON_NOT_FOUND,
+                 TECHNICAL_FAILURE -> {
+
+                coordinator.cancelReservation(
+                        ticket.id()
+                );
+
+                clearClaimInProgress(
+                        ticket.id()
+                );
+
+                appendLog(
+                        "NO SE ENVIÓ EL CLIC PARA "
+                                + ticket.channelName()
+                                + " después de "
+                                + elapsedMillis
+                                + " ms: "
+                                + claimResult.detail()
+                                + " Se reintentará si la mención "
+                                + "continúa visible."
+                );
+
+                refreshCoordinatorView();
+                persistCurrentState();
+            }
+
+            case CLICK_FAILED -> {
+                coordinator.cancelReservation(
+                        ticket.id()
+                );
+
+                temporarilyFailedTicketIds.add(
+                        ticket.id()
+                );
+
+                clearClaimInProgress(
+                        ticket.id()
+                );
+
+                appendLog(
+                        "EL CLIC FALLÓ O QUEDÓ EN ESTADO INCIERTO PARA "
+                                + ticket.channelName()
+                                + " después de "
+                                + elapsedMillis
+                                + " ms: "
+                                + claimResult.detail()
+                );
+
+                refreshCoordinatorView();
+                persistCurrentState();
+            }
+
+            case CONFIRMATION_TIMEOUT -> {
+                /*
+                 * Este estado ya no debería producirlo el reclamador
+                 * después de separar clic y confirmación.
+                 */
+                coordinator.confirmReservation(ticket.id());
+
+                clearClaimInProgress(ticket.id());
+
+                appendLog(
+                        "Reclamación registrada como activa por seguridad: "
+                                + ticket.channelName()
+                );
+
+                refreshCoordinatorView();
+                persistCurrentState();
+            }
+        }
+    }
+
+    private void scheduleClaimConfirmationInspection(
+            TicketCandidate ticket,
+            ChannelObservation observation,
+            String minecraftUsername,
+            long deadlineNanos
+    ) {
+        CompletableFuture.delayedExecutor(
+                CLAIM_CONFIRMATION_POLL_MILLIS,
+                TimeUnit.MILLISECONDS
+        ).execute(() ->
+                inspectPendingClaimConfirmation(
+                        ticket,
+                        observation,
+                        minecraftUsername,
+                        deadlineNanos
+                )
+        );
+    }
+
+    private void inspectPendingClaimConfirmation(
+            TicketCandidate ticket,
+            ChannelObservation observation,
+            String minecraftUsername,
+            long deadlineNanos
+    ) {
+        if (!ticket.id().equals(claimInProgressId)) {
+            return;
+        }
+
+        browserService.inspectClaimConfirmation(
+                observation.server(),
+                minecraftUsername
+        ).whenComplete((confirmationOptional, error) ->
+                Platform.runLater(() ->
+                        handlePendingClaimConfirmation(
+                                ticket,
+                                observation,
+                                minecraftUsername,
+                                deadlineNanos,
+                                confirmationOptional,
+                                error
+                        )
+                )
+        );
+    }
+
+    private void handlePendingClaimConfirmation(
+            TicketCandidate ticket,
+            ChannelObservation observation,
+            String minecraftUsername,
+            long deadlineNanos,
+            Optional<TicketClaimResult> confirmationOptional,
+            Throwable error
+    ) {
+        if (!ticket.id().equals(claimInProgressId)) {
+            return;
+        }
+
+        if (error == null
+                && confirmationOptional != null
+                && confirmationOptional.isPresent()) {
+
+            TicketClaimResult confirmation =
+                    confirmationOptional.get();
+
+            if (confirmation.status()
+                    == TicketClaimStatus.CLAIMED_BY_US) {
+
+                coordinator.confirmReservation(ticket.id());
+
+                appendLog(
+                        "TICKET CONFIRMADO A NUESTRO NOMBRE: "
+                                + ticket.channelName()
+                                + " | "
+                                + confirmation.claimedBy()
+                );
+
+            } else if (confirmation.status()
+                    == TicketClaimStatus.CLAIMED_BY_OTHER) {
+
+                coordinator.markClaimedByOther(ticket.id());
+
+                appendLog(
+                        "El clic compitió con otro usuario y el ticket "
+                                + "quedó para "
+                                + confirmation.claimedBy()
+                                + ": "
+                                + ticket.channelName()
+                );
+
+            } else {
+                /*
+                 * La inspección de confirmación solamente debería
+                 * devolver los dos estados anteriores.
+                 */
+                scheduleClaimConfirmationInspection(
+                        ticket,
+                        observation,
+                        minecraftUsername,
+                        deadlineNanos
+                );
+
+                return;
+            }
+
+            clearClaimInProgress(ticket.id());
+
+            refreshCoordinatorView();
+            persistCurrentState();
+            return;
+        }
+
+        if (System.nanoTime() >= deadlineNanos) {
+            /*
+             * Sabemos que el clic se envió, aunque no pudimos leer
+             * la respuesta. Se conserva como activo para no exceder
+             * accidentalmente el límite de tres.
+             */
+            coordinator.confirmReservation(ticket.id());
+
+            clearClaimInProgress(ticket.id());
+
+            appendLog(
+                    "ADVERTENCIA: EL CLIC FUE ENVIADO, PERO NO SE "
+                            + "ENCONTRÓ CONFIRMACIÓN PARA "
+                            + ticket.channelName()
+                            + ". Se registró como activo por seguridad."
+            );
+
+            refreshCoordinatorView();
+            persistCurrentState();
+            return;
+        }
+
+        /*
+         * Un error transitorio durante una revisión no cancela
+         * una reclamación cuyo clic ya fue enviado.
+         */
+        scheduleClaimConfirmationInspection(
+                ticket,
+                observation,
+                minecraftUsername,
+                deadlineNanos
+        );
+    }
+
+    private void clearClaimInProgress(
+            TicketId ticketId
+    ) {
+        if (ticketId.equals(claimInProgressId)) {
+            claimInProgressId = null;
+        }
+    }
+
     @Override
-    public void stop() throws Exception {
+    public void stop() {
         coordinator.pause();
 
         persistCurrentState();
+        releaseSleepProtection();
 
         if (monitoringLoop != null) {
             monitoringLoop.close();
@@ -1426,6 +2047,21 @@ public final class TicketAssistantApp extends Application {
 
         if (browserService != null) {
             browserService.close();
+        }
+
+        if (trayManager != null) {
+            trayManager.close();
+        }
+
+        if (awakeController != null) {
+            try {
+                awakeController.close();
+            } catch (RuntimeException ignored) {
+                /*
+                 * Al terminar el proceso Windows eliminará también
+                 * cualquier solicitud asociada al hilo.
+                 */
+            }
         }
     }
 }

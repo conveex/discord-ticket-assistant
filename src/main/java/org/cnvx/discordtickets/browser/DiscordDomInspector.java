@@ -6,150 +6,163 @@ import com.microsoft.playwright.Page;
 import com.microsoft.playwright.PlaywrightException;
 
 import java.net.URI;
-import java.util.ArrayList;
-import java.util.LinkedHashMap;
-import java.util.List;
-import java.util.Map;
+import java.util.*;
 
 public final class DiscordDomInspector {
 
-    private static final String CHANNEL_ITEM_SELECTOR =
-            "[data-list-item-id^='channels___']";
+    private static final String MENTIONED_CHANNELS_SCRIPT = """
+        () => {
+            const result = [];
 
-    private static final String HAS_MENTION_SCRIPT = """
-            el => {
-                let current = el;
+            const items = document.querySelectorAll(
+                "[data-list-item-id^='channels___']"
+            );
+
+            for (const item of items) {
+                let current = item;
+                let hasMention = false;
 
                 for (
                     let depth = 0;
-                    current && depth < 5;
+                    current && depth < 6;
                     depth++, current = current.parentElement
                 ) {
-                    const numericBadge = current.querySelector(
+                    const badge = current.querySelector(
                         '[class*="numberBadge"]'
                     );
 
                     if (
-                        numericBadge
+                        badge
                         && /^\\d+$/.test(
-                            (numericBadge.textContent || '').trim()
+                            (badge.textContent || '').trim()
                         )
                     ) {
-                        return true;
+                        hasMention = true;
+                        break;
                     }
 
-                    const accessibleTexts =
-                        current.querySelectorAll('span');
+                    const spans = current.querySelectorAll('span');
 
-                    for (const span of accessibleTexts) {
+                    for (const span of spans) {
                         const text = span.textContent || '';
 
-                        if (/\\d+\\s+menci[oó]n/i.test(text)) {
-                            return true;
+                        if (/\\d+\\s+menci[oó]n(?:es)?/i.test(text)) {
+                            hasMention = true;
+                            break;
                         }
+                    }
+
+                    if (hasMention) {
+                        break;
                     }
                 }
 
-                return false;
+                if (!hasMention) {
+                    continue;
+                }
+
+                const link = item.matches(
+                    "a[href*='/channels/']"
+                )
+                    ? item
+                    : item.querySelector(
+                        "a[href*='/channels/']"
+                    );
+
+                if (!link) {
+                    continue;
+                }
+
+                result.push({
+                    text: (
+                        item.innerText
+                        || item.textContent
+                        || ''
+                    ).trim(),
+
+                    href: link.getAttribute('href') || ''
+                });
             }
-            """;
+
+            return result;
+        }
+        """;
 
     public List<ChannelObservation> findMentionedTicketChannels(
             Page page,
             ServerType server
     ) {
-        Locator items = page.locator(CHANNEL_ITEM_SELECTOR);
+        Object rawResult = page.evaluate(
+                MENTIONED_CHANNELS_SCRIPT
+        );
+
+        if (!(rawResult instanceof List<?> rows)) {
+            return List.of();
+        }
 
         Map<String, ChannelObservation> observations =
                 new LinkedHashMap<>();
 
-        int count = items.count();
-
-        for (int index = 0; index < count; index++) {
-            Locator item = items.nth(index);
-
-            try {
-                String visibleText = item.innerText();
-
-                var parsedOptional =
-                        TicketChannelParser.parse(
-                                server,
-                                visibleText
-                        );
-
-                if (parsedOptional.isEmpty()) {
-                    continue;
-                }
-
-                if (!hasMention(item)) {
-                    continue;
-                }
-
-                String href = findHref(item);
-
-                if (href == null || href.isBlank()) {
-                    continue;
-                }
-
-                String absoluteUrl = resolveUrl(
-                        page.url(),
-                        href
-                );
-
-                String channelId =
-                        extractChannelId(absoluteUrl);
-
-                if (channelId == null) {
-                    continue;
-                }
-
-                ParsedTicketChannel parsed =
-                        parsedOptional.get();
-
-                observations.put(
-                        channelId,
-                        new ChannelObservation(
-                                server,
-                                channelId,
-                                parsed.matchedChannelName(),
-                                parsed.ticketNumber(),
-                                parsed.category(),
-                                absoluteUrl
-                        )
-                );
-            } catch (PlaywrightException exception) {
-                /*
-                 * Discord puede volver a dibujar la barra lateral
-                 * mientras la estamos leyendo. Ese elemento se
-                 * ignora y aparecerá en la siguiente inspección.
-                 */
+        for (Object rowObject : rows) {
+            if (!(rowObject instanceof Map<?, ?> row)) {
+                continue;
             }
+
+            String text = Objects.toString(
+                    row.get("text"),
+                    ""
+            );
+
+            String href = Objects.toString(
+                    row.get("href"),
+                    ""
+            );
+
+            if (text.isBlank() || href.isBlank()) {
+                continue;
+            }
+
+            var parsedOptional =
+                    TicketChannelParser.parse(
+                            server,
+                            text
+                    );
+
+            if (parsedOptional.isEmpty()) {
+                continue;
+            }
+
+            String absoluteUrl = resolveUrl(
+                    page.url(),
+                    href
+            );
+
+            String channelId =
+                    extractChannelId(absoluteUrl);
+
+            if (channelId == null) {
+                continue;
+            }
+
+            ParsedTicketChannel parsed =
+                    parsedOptional.get();
+
+            observations.put(
+                    channelId,
+                    new ChannelObservation(
+                            server,
+                            channelId,
+                            parsed.matchedChannelName(),
+                            parsed.ticketNumber(),
+                            parsed.category(),
+                            absoluteUrl
+                    )
+            );
         }
 
-        return new ArrayList<>(observations.values());
-    }
-
-    private boolean hasMention(Locator item) {
-        Object result = item.evaluate(HAS_MENTION_SCRIPT);
-        return Boolean.TRUE.equals(result);
-    }
-
-    private String findHref(Locator item) {
-        String ownHref = item.getAttribute("href");
-
-        if (ownHref != null && !ownHref.isBlank()) {
-            return ownHref;
-        }
-
-        Locator link = item.locator(
-                "a[href*='/channels/']"
-        ).first();
-
-        if (link.count() == 0) {
-            return null;
-        }
-
-        return link.getAttribute("href");
+        return List.copyOf(
+                observations.values()
+        );
     }
 
     private String resolveUrl(

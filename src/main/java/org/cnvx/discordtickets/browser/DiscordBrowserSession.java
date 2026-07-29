@@ -7,34 +7,42 @@ import com.microsoft.playwright.Playwright;
 import com.microsoft.playwright.options.WaitUntilState;
 import org.cnvx.discordtickets.model.ServerType;
 
-import java.io.IOException;
-import java.nio.file.Files;
 import java.nio.file.Path;
-import java.util.ArrayList;
 import java.util.List;
+import java.util.Objects;
 
-public class DiscordBrowserSession implements AutoCloseable {
+public final class DiscordBrowserSession
+        implements AutoCloseable {
 
     private Playwright playwright;
-    private BrowserContext context;
+    private BrowserContext browserContext;
 
     private Page skyblockPage;
     private Page kuudraPage;
 
-    public void open(List<String> discordUrls) {
-        if (discordUrls == null || discordUrls.size() != 2) {
+    public void open(List<String> urls) {
+        Objects.requireNonNull(
+                urls,
+                "Las URL de Discord son obligatorias."
+        );
+
+        if (urls.size() != 2) {
             throw new IllegalArgumentException(
-                    "Se esperaban exactamente dos direcciones de Discord."
+                    "Se esperaban exactamente dos URL de Discord."
             );
         }
 
-        if (context != null) {
-            throw new IllegalStateException(
-                    "La sesión del navegador ya se encuentra abierta."
-            );
+        if (isHealthy()) {
+            return;
         }
 
-        Path profileDirectory = createProfileDirectory();
+        close();
+
+        Path profileDirectory = Path.of(
+                System.getProperty("user.home"),
+                ".discord-ticket-assistant",
+                "chrome-profile"
+        );
 
         playwright = Playwright.create();
 
@@ -44,85 +52,71 @@ public class DiscordBrowserSession implements AutoCloseable {
                         .setHeadless(false)
                         .setChromiumSandbox(true);
 
-        context = playwright.chromium().launchPersistentContext(
-                profileDirectory,
-                options
-        );
+        browserContext = playwright
+                .chromium()
+                .launchPersistentContext(
+                        profileDirectory,
+                        options
+                );
 
-        context.setDefaultTimeout(10_000);
-        preparePages(discordUrls);
-    }
-
-    private void preparePages(List<String> discordUrls) {
-        List<Page> initialPages = new ArrayList<>(context.pages());
+        List<Page> initialPages =
+                browserContext.pages();
 
         if (initialPages.isEmpty()) {
-            skyblockPage = context.newPage();
+            skyblockPage = browserContext.newPage();
         } else {
             skyblockPage = initialPages.getFirst();
 
-            /*
-             * Cerramos páginas sobrantes restauradas por Chrome para que
-             * la aplicación mantenga únicamente las dos que controla.
-             */
-            for (int index = 1; index < initialPages.size(); index++) {
+            for (int index = 1;
+                 index < initialPages.size();
+                 index++) {
+
                 initialPages.get(index).close();
             }
         }
 
-        kuudraPage = context.newPage();
+        kuudraPage = browserContext.newPage();
 
-        navigate(skyblockPage, discordUrls.get(0));
-        navigate(kuudraPage, discordUrls.get(1));
-    }
+        navigate(
+                skyblockPage,
+                urls.get(0)
+        );
 
-    private void navigate(Page page, String url) {
-        page.navigate(
-                url,
-                new Page.NavigateOptions()
-                        .setWaitUntil(WaitUntilState.DOMCONTENTLOADED)
-                        .setTimeout(30_000)
+        navigate(
+                kuudraPage,
+                urls.get(1)
         );
     }
 
-    private Path createProfileDirectory() {
-        Path profileDirectory = Path.of(
-                System.getProperty("user.home"),
-                ".discord-ticket-assistant",
-                "chrome-profile"
-        );
-
+    public boolean isHealthy() {
         try {
-            return Files.createDirectories(profileDirectory);
-        } catch (IOException exception) {
-            throw new IllegalStateException(
-                    "No fue posible crear el perfil de Chrome en: "
-                            + profileDirectory,
-                    exception
-            );
+            return playwright != null
+                    && browserContext != null
+                    && !browserContext.isClosed()
+                    && skyblockPage != null
+                    && !skyblockPage.isClosed()
+                    && kuudraPage != null
+                    && !kuudraPage.isClosed();
+
+        } catch (RuntimeException exception) {
+            return false;
         }
     }
 
     public Page skyblockPage() {
-        ensureOpened();
+        ensureHealthy();
         return skyblockPage;
     }
 
     public Page kuudraPage() {
-        ensureOpened();
+        ensureHealthy();
         return kuudraPage;
     }
 
-    private void ensureOpened() {
-        if (context == null) {
-            throw new IllegalStateException(
-                    "La sesión del navegador no esttá abierta."
-            );
-        }
-    }
-
     public Page pageFor(ServerType server) {
-        ensureOpened();
+        Objects.requireNonNull(server);
+
+        ensureHealthy();
 
         return switch (server) {
             case SKYBLOCK_MANIACS -> skyblockPage;
@@ -130,19 +124,52 @@ public class DiscordBrowserSession implements AutoCloseable {
         };
     }
 
+    private void navigate(
+            Page page,
+            String url
+    ) {
+        page.navigate(
+                url,
+                new Page.NavigateOptions()
+                        .setWaitUntil(
+                                WaitUntilState.DOMCONTENTLOADED
+                        )
+                        .setTimeout(30_000)
+        );
+    }
+
+    private void ensureHealthy() {
+        if (!isHealthy()) {
+            throw new IllegalStateException(
+                    "La sesión automatizada de Chrome "
+                            + "no se encuentra disponible."
+            );
+        }
+    }
+
     @Override
     public void close() {
-        if (context != null) {
-            context.close();
-            context = null;
+        try {
+            if (browserContext != null
+                    && !browserContext.isClosed()) {
+
+                browserContext.close();
+            }
+        } catch (RuntimeException ignored) {
+            // Chrome podría haber sido cerrado externamente.
         }
 
-        if (playwright != null) {
-            playwright.close();
-            playwright = null;
+        try {
+            if (playwright != null) {
+                playwright.close();
+            }
+        } catch (RuntimeException ignored) {
+            // La conexión con Playwright podría estar terminada.
         }
 
         skyblockPage = null;
         kuudraPage = null;
+        browserContext = null;
+        playwright = null;
     }
 }
