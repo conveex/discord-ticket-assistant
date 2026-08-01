@@ -185,6 +185,12 @@ public final class DiscordTicketClaimer {
     ) {
 
         try {
+            long claimStartedAt = System.nanoTime();
+
+            page.bringToFront();
+
+            long pageActivatedAt = System.nanoTime();
+
             boolean channelWasAlreadyOpen =
                     isCurrentChannel(
                             page,
@@ -204,6 +210,8 @@ public final class DiscordTicketClaimer {
                 );
             }
 
+            long channelOpenedAt = System.nanoTime();
+
             boolean targetInterfaceReady =
                     waitForTargetClaimUi(
                             page,
@@ -211,6 +219,8 @@ public final class DiscordTicketClaimer {
                             previousChatFingerprint,
                             !channelWasAlreadyOpen
                     );
+
+            long interfaceReadyAt = System.nanoTime();
 
             if (!targetInterfaceReady) {
                 return new TicketClaimResult(
@@ -272,7 +282,6 @@ public final class DiscordTicketClaimer {
                         new Locator.ClickOptions()
                                 .setTimeout(3_000)
                 );
-
             } catch (PlaywrightException exception) {
                 Optional<String> confirmationAfterFailure =
                         findLatestConfirmationText(page);
@@ -291,16 +300,32 @@ public final class DiscordTicketClaimer {
                 );
             }
 
-            long clickElapsedMillis =
-                    (System.nanoTime() - clickStartedAt)
-                            / 1_000_000;
+            long clickCompletedAt = System.nanoTime();
 
             return new TicketClaimResult(
                     TicketClaimStatus.CLICK_SENT,
                     "",
-                    "El clic fue enviado en "
-                            + clickElapsedMillis
-                            + " ms."
+                    "activar="
+                            + elapsedMillis(
+                            claimStartedAt,
+                            pageActivatedAt
+                    )
+                            + " ms, abrirCanal="
+                            + elapsedMillis(
+                            pageActivatedAt,
+                            channelOpenedAt
+                    )
+                            + " ms, esperarInterfaz="
+                            + elapsedMillis(
+                            channelOpenedAt,
+                            interfaceReadyAt
+                    )
+                            + " ms, clic="
+                            + elapsedMillis(
+                            interfaceReadyAt,
+                            clickCompletedAt
+                    )
+                            + " ms"
             );
 
         } catch (PlaywrightException exception) {
@@ -561,5 +586,12 @@ public final class DiscordTicketClaimer {
         } catch (PlaywrightException exception) {
             return false;
         }
+    }
+
+    private long elapsedMillis(
+            long start,
+            long end
+    ) {
+        return (end - start) / 1_000_000;
     }
 }

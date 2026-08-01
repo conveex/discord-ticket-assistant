@@ -104,6 +104,40 @@ class TicketDiscoveryTrackerTest {
         assertEquals(1, afterRestart.size());
     }
 
+    @Test
+    void detectsNewTicketAfterManyEmptyInspections() {
+        TicketDiscoveryTracker tracker =
+                new TicketDiscoveryTracker();
+
+        tracker.beginSession(true);
+
+        ChannelObservation first =
+                observation(
+                        "1001"
+                );
+
+        ChannelObservation second =
+                observation(
+                        "1002"
+                );
+
+        assertEquals(
+                List.of(first),
+                tracker.findNew(List.of(first))
+        );
+
+        for (int index = 0; index < 1_000; index++) {
+            assertTrue(
+                    tracker.findNew(List.of()).isEmpty()
+            );
+        }
+
+        assertEquals(
+                List.of(second),
+                tracker.findNew(List.of(second))
+        );
+    }
+
     private static ChannelObservation observation(
             String channelId
     ) {

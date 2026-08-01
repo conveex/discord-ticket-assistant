@@ -1,26 +1,25 @@
 package org.cnvx.discordtickets.browser;
 
 import org.cnvx.discordtickets.model.ServerType;
-import com.microsoft.playwright.Locator;
 import com.microsoft.playwright.Page;
-import com.microsoft.playwright.PlaywrightException;
 
 import java.net.URI;
 import java.util.*;
 
 public final class DiscordDomInspector {
 
-    private static final String MENTIONED_CHANNELS_SCRIPT = """
-        () => {
+    private static final String PAGE_INSPECTION_SCRIPT = """
+        expectedGuildId => {
             const result = [];
 
-            const items = document.querySelectorAll(
-                "[data-list-item-id^='channels___']"
+            const items = Array.from(
+                document.querySelectorAll(
+                    "[data-list-item-id^='channels___']"
+                )
             );
 
-            for (const item of items) {
+            function hasMentionIndicator(item) {
                 let current = item;
-                let hasMention = false;
 
                 for (
                     let depth = 0;
@@ -37,27 +36,28 @@ public final class DiscordDomInspector {
                             (badge.textContent || '').trim()
                         )
                     ) {
-                        hasMention = true;
-                        break;
+                        return true;
                     }
 
-                    const spans = current.querySelectorAll('span');
+                    const combinedText = [
+                        current.getAttribute('aria-label') || '',
+                        current.getAttribute('title') || '',
+                        current.innerText || ''
+                    ].join(' ');
 
-                    for (const span of spans) {
-                        const text = span.textContent || '';
-
-                        if (/\\d+\\s+menci[oó]n(?:es)?/i.test(text)) {
-                            hasMention = true;
-                            break;
-                        }
-                    }
-
-                    if (hasMention) {
-                        break;
+                    if (
+                        /\\d+\\s+(?:menci[oó]n(?:es)?|mentions?)/i
+                            .test(combinedText)
+                    ) {
+                        return true;
                     }
                 }
 
-                if (!hasMention) {
+                return false;
+            }
+
+            for (const item of items) {
+                if (!hasMentionIndicator(item)) {
                     continue;
                 }
 
@@ -84,20 +84,105 @@ public final class DiscordDomInspector {
                 });
             }
 
-            return result;
+            function readGuildMentionCount(guildId) {
+                if (!guildId) {
+                    return 0;
+                }
+
+                const guildItem = document.querySelector(
+                    `[data-list-item-id="guildsnav___${guildId}"]`
+                );
+
+                if (!guildItem) {
+                    return 0;
+                }
+
+                const numericBadges =
+                    guildItem.querySelectorAll(
+                        '[class*="numberBadge"]'
+                    );
+
+                for (const badge of numericBadges) {
+                    const text = (
+                        badge.textContent || ''
+                    ).trim();
+
+                    if (/^\\d+$/.test(text)) {
+                        return Number.parseInt(text, 10);
+                    }
+                }
+
+                const combinedText = [
+                    guildItem.getAttribute('aria-label') || '',
+                    guildItem.getAttribute('title') || '',
+                    guildItem.innerText || ''
+                ].join(' ');
+
+                const match = combinedText.match(
+                    /(\\d+)\\s+(?:menci[oó]n(?:es)?|mentions?)/i
+                );
+
+                return match
+                    ? Number.parseInt(match[1], 10)
+                    : 0;
+            }
+
+            const pathSegments =
+                window.location.pathname
+                    .split('/')
+                    .filter(Boolean);
+
+            const currentGuildId =
+                pathSegments.length >= 2
+                && pathSegments[0] === 'channels'
+                    ? pathSegments[1]
+                    : '';
+
+            return {
+                rows: result,
+
+                health: {
+                    currentUrl: window.location.href,
+                    currentGuildId,
+                    readyState: document.readyState,
+                    visibilityState:
+                        document.visibilityState || '',
+                    wasDiscarded:
+                        Boolean(document.wasDiscarded),
+                    renderedChannelItems: items.length,
+                    guildMentionCount:
+                        readGuildMentionCount(
+                            expectedGuildId
+                        )
+                }
+            };
         }
         """;
 
-    public List<ChannelObservation> findMentionedTicketChannels(
+    public DiscordPageInspection inspect(
             Page page,
-            ServerType server
+            ServerType server,
+            String expectedGuildId
     ) {
         Object rawResult = page.evaluate(
-                MENTIONED_CHANNELS_SCRIPT
+                PAGE_INSPECTION_SCRIPT,
+                expectedGuildId
         );
 
-        if (!(rawResult instanceof List<?> rows)) {
-            return List.of();
+        if (!(rawResult instanceof Map<?, ?> root)) {
+            return emptyInspection(page);
+        }
+
+        DiscordPageHealth health =
+                readHealth(root, page);
+
+        Object rawRows = root.get("rows");
+
+        if (!(rawRows instanceof List<?> rows)) {
+            return new DiscordPageInspection(
+                    List.of(),
+                    health
+            );
         }
 
         Map<String, ChannelObservation> observations =
@@ -160,9 +245,115 @@ public final class DiscordDomInspector {
             );
         }
 
-        return List.copyOf(
-                observations.values()
+        return new DiscordPageInspection(
+                List.copyOf(observations.values()),
+                health
         );
+    }
+
+    public List<ChannelObservation> findMentionedTicketChannels(
+            Page page,
+            ServerType server
+    ) {
+        String guildId = extractGuildId(page.url());
+
+        return inspect(
+                page,
+                server,
+                guildId
+        ).observations();
+    }
+
+    private DiscordPageHealth readHealth(
+            Map<?, ?> root,
+            Page page
+    ) {
+        Object rawHealth = root.get("health");
+
+        if (!(rawHealth instanceof Map<?, ?> health)) {
+            return new DiscordPageHealth(
+                    page.url(),
+                    "",
+                    "",
+                    "",
+                    false,
+                    0,
+                    0
+            );
+        }
+
+        return new DiscordPageHealth(
+                Objects.toString(
+                        health.get("currentUrl"),
+                        page.url()
+                ),
+                Objects.toString(
+                        health.get("currentGuildId"),
+                        ""
+                ),
+                Objects.toString(
+                        health.get("readyState"),
+                        ""
+                ),
+                Objects.toString(
+                        health.get("visibilityState"),
+                        ""
+                ),
+                Boolean.TRUE.equals(
+                        health.get("wasDiscarded")
+                ),
+                integerValue(
+                        health.get("renderedChannelItems")
+                ),
+                integerValue(
+                        health.get("guildMentionCount")
+                )
+        );
+    }
+
+    private DiscordPageInspection emptyInspection(
+            Page page
+    ) {
+        return new DiscordPageInspection(
+                List.of(),
+                new DiscordPageHealth(
+                        page.url(),
+                        "",
+                        "",
+                        "",
+                        false,
+                        0,
+                        0
+                )
+        );
+    }
+
+    private int integerValue(Object value) {
+        return value instanceof Number number ? number.intValue() : 0;
+    }
+
+    private String extractGuildId(String url) {
+        String path = URI.create(url).getPath();
+
+        if (path == null) {
+            return "";
+        }
+
+        String[] segments = path.split("/");
+
+        /*
+         * /channels/GUILD_ID/CHANNEL_ID
+         */
+        for (int index = 0;
+             index < segments.length - 1;
+             index++) {
+
+            if ("channels".equals(segments[index])) {
+                return segments[index + 1];
+            }
+        }
+
+        return "";
     }
 
     private String resolveUrl(

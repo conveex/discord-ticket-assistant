@@ -83,6 +83,7 @@ public final class TicketAssistantApp extends Application {
     private Button startButton;
     private Button pauseButton;
     private Button resumeButton;
+    private Button reconnectButton;
 
     private ListView<TicketCandidate> activeTicketsListView;
 
@@ -128,6 +129,12 @@ public final class TicketAssistantApp extends Application {
             150;
 
     private TicketId claimInProgressId;
+
+    private long successfulInspectionCount;
+
+    private final Set<ServerType>
+            pendingServerRefreshes =
+            EnumSet.noneOf(ServerType.class);
 
     /*
      * Tickets que llegaron después de la línea base y, por tanto,
@@ -273,12 +280,23 @@ public final class TicketAssistantApp extends Application {
                 event -> stopMonitoring()
         );
 
+        reconnectButton = new Button(
+                "Reconectar Discord"
+        );
+
+        reconnectButton.setDisable(true);
+
+        reconnectButton.setOnAction(
+                event -> reconnectDiscord()
+        );
+
         HBox monitoringButtons = new HBox(
                 10,
                 startButton,
                 pauseButton,
                 resumeButton,
-                stopButton
+                stopButton,
+                reconnectButton
         );
 
         activeTicketsListView = new ListView<>(activeTicketItems);
@@ -680,6 +698,57 @@ public final class TicketAssistantApp extends Application {
 
         refreshCoordinatorView();
         persistCurrentState();
+
+        if (completed) {
+            requestServerRefreshAfterCompletion(
+                    ticket.id().server()
+            );
+        }
+    }
+
+    private void requestServerRefreshAfterCompletion(
+            ServerType server
+    ) {
+        if (claimInProgressId != null
+                && claimInProgressId.server() == server) {
+
+            pendingServerRefreshes.add(server);
+
+            appendLog(
+                    "La renovación de "
+                            + server.displayName()
+                            + " quedó pendiente porque existe "
+                            + "una reclamación en curso."
+            );
+
+            return;
+        }
+
+        refreshServerPage(server);
+    }
+
+    private void refreshServerPage(
+            ServerType server
+    ) {
+        browserService.reconnectServer(server)
+                .whenComplete((ignored, error) ->
+                        Platform.runLater(() -> {
+                            if (error == null) {
+                                appendLog(
+                                        "Pestaña renovada después de "
+                                                + "completar el carry: "
+                                                + server.displayName()
+                                );
+                            } else {
+                                appendLog(
+                                        "No fue posible renovar "
+                                                + server.displayName()
+                                                + ": "
+                                                + readableError(error)
+                                );
+                            }
+                        })
+                );
     }
 
     private void refreshCoordinatorView() {
@@ -806,11 +875,15 @@ public final class TicketAssistantApp extends Application {
 
             lastMonitoringError = null;
 
+            successfulInspectionCount++;
+
             automaticMonitorLabel.setText(
                     "Monitor automático: ACTIVO · última revisión "
                             + LocalTime.now().format(
                             MONITOR_TIME_FORMAT
                     )
+                            + " · ciclos "
+                            + successfulInspectionCount
             );
 
             /*
@@ -1588,6 +1661,7 @@ public final class TicketAssistantApp extends Application {
 
         switch (event.state()) {
             case STARTING -> {
+                reconnectButton.setDisable(true);
                 browserReady = false;
 
                 browserStatusLabel.setText(
@@ -1600,6 +1674,7 @@ public final class TicketAssistantApp extends Application {
             }
 
             case READY -> {
+                reconnectButton.setDisable(false);
                 browserReady = true;
 
                 browserStatusLabel.setText(
@@ -1625,6 +1700,7 @@ public final class TicketAssistantApp extends Application {
             }
 
             case RECOVERING -> {
+                reconnectButton.setDisable(true);
                 browserReady = false;
 
                 browserStatusLabel.setText(
@@ -1639,6 +1715,7 @@ public final class TicketAssistantApp extends Application {
             }
 
             case ERROR -> {
+                reconnectButton.setDisable(true);
                 browserReady = false;
 
                 browserStatusLabel.setText(
@@ -1662,6 +1739,7 @@ public final class TicketAssistantApp extends Application {
             }
 
             case CLOSED -> {
+                reconnectButton.setDisable(true);
                 browserReady = false;
 
                 browserStatusLabel.setText(
@@ -1748,9 +1826,11 @@ public final class TicketAssistantApp extends Application {
                 appendLog(
                         "CLIC ENVIADO: "
                                 + ticket.channelName()
-                                + " | tiempo desde la reserva: "
+                                + " | total desde reserva: "
                                 + elapsedMillis
                                 + " ms"
+                                + " | "
+                                + claimResult.detail()
                 );
 
                 /*
@@ -2029,9 +2109,63 @@ public final class TicketAssistantApp extends Application {
     private void clearClaimInProgress(
             TicketId ticketId
     ) {
-        if (ticketId.equals(claimInProgressId)) {
-            claimInProgressId = null;
+        if (!ticketId.equals(claimInProgressId)) {
+            return;
         }
+
+        claimInProgressId = null;
+
+        processPendingServerRefreshes();
+    }
+
+    private void processPendingServerRefreshes() {
+        if (claimInProgressId != null
+                || pendingServerRefreshes.isEmpty()) {
+            return;
+        }
+
+        Set<ServerType> pending =
+                EnumSet.noneOf(ServerType.class);
+
+        pending.addAll(pendingServerRefreshes);
+        pendingServerRefreshes.clear();
+
+        for (ServerType server : pending) {
+            refreshServerPage(server);
+        }
+    }
+
+    private void reconnectDiscord() {
+        if (claimInProgressId != null) {
+            showValidationError(
+                    "No puede reconectarse Discord mientras "
+                            + "se está reclamando un ticket."
+            );
+
+            return;
+        }
+
+        reconnectButton.setDisable(true);
+
+        appendLog(
+                "Reconectando las pestañas de Discord..."
+        );
+
+        browserService.reconnectAll()
+                .whenComplete((ignored, error) ->
+                        Platform.runLater(() -> {
+                            reconnectButton.setDisable(
+                                    !browserReady
+                            );
+
+                            if (error != null) {
+                                appendLog(
+                                        "ERROR AL RECONECTAR DISCORD: "
+                                                + readableError(error)
+                                );
+                            }
+                        })
+                );
     }
 
     @Override

@@ -43,6 +43,32 @@ public final class BrowserAutomationService
 
     private long nextRecoveryAttemptAtMillis;
 
+    private static final int
+            STRUCTURAL_FAILURES_BEFORE_RECOVERY = 8;
+
+    private static final int
+            MENTION_MISMATCHES_BEFORE_RECOVERY = 4;
+
+    private static final long
+            SERVER_RECOVERY_COOLDOWN_MILLIS =
+            Duration.ofSeconds(30).toMillis();
+
+    private final Map<ServerType, Integer>
+            structuralFailureCounts =
+            new EnumMap<>(ServerType.class);
+
+    private final Map<ServerType, Integer>
+            mentionMismatchCounts =
+            new EnumMap<>(ServerType.class);
+
+    private final Map<ServerType, Integer>
+            recoveredMentionCounts =
+            new EnumMap<>(ServerType.class);
+
+    private final Map<ServerType, Long>
+            nextServerRecoveryAtMillis =
+            new EnumMap<>(ServerType.class);
+
     public void setStatusListener(
             Consumer<BrowserStatusEvent> statusListener
     ) {
@@ -122,8 +148,8 @@ public final class BrowserAutomationService
                     ServerType.SKYBLOCK_MANIACS
             )) {
                 observations.addAll(
-                        inspector.findMentionedTicketChannels(
-                                browserSession.skyblockPage(),
+                        inspectServerPage(
+                                inspector,
                                 ServerType.SKYBLOCK_MANIACS
                         )
                 );
@@ -133,8 +159,8 @@ public final class BrowserAutomationService
                     ServerType.KUUDRA_GANG
             )) {
                 observations.addAll(
-                        inspector.findMentionedTicketChannels(
-                                browserSession.kuudraPage(),
+                        inspectServerPage(
+                                inspector,
                                 ServerType.KUUDRA_GANG
                         )
                 );
@@ -358,5 +384,238 @@ public final class BrowserAutomationService
                     minecraftUsername
             );
         }, executor);
+    }
+
+    private List<ChannelObservation> inspectServerPage(
+            DiscordDomInspector inspector,
+            ServerType server
+    ) {
+        var page = browserSession.pageFor(server);
+
+        String expectedGuildId =
+                browserSession.expectedGuildId(server);
+
+        DiscordPageInspection inspection =
+                inspector.inspect(
+                        page,
+                        server,
+                        expectedGuildId
+                );
+
+        DiscordPageHealth health =
+                inspection.health();
+
+        if (!health.structurallyHealthyFor(
+                expectedGuildId
+        )) {
+            int failureCount =
+                    structuralFailureCounts.merge(
+                            server,
+                            1,
+                            Integer::sum
+                    );
+
+            if (failureCount
+                    >= STRUCTURAL_FAILURES_BEFORE_RECOVERY) {
+
+                return recoverServerAndInspect(
+                        inspector,
+                        server,
+                        "La pestaña dejó de mostrar una "
+                                + "barra lateral válida."
+                );
+            }
+
+            return inspection.observations();
+        }
+
+        structuralFailureCounts.put(server, 0);
+
+        boolean unexplainedGuildMention =
+                health.guildMentionCount() > 0
+                        && inspection.observations().isEmpty();
+
+        if (!unexplainedGuildMention) {
+            mentionMismatchCounts.put(server, 0);
+
+            if (health.guildMentionCount() == 0
+                    || !inspection.observations().isEmpty()) {
+
+                recoveredMentionCounts.remove(server);
+            }
+
+            return inspection.observations();
+        }
+
+        int mismatchCount =
+                mentionMismatchCounts.merge(
+                        server,
+                        1,
+                        Integer::sum
+                );
+
+        Integer alreadyRecoveredForCount =
+                recoveredMentionCounts.get(server);
+
+        boolean recoveryAlreadyAttempted =
+                alreadyRecoveredForCount != null
+                        && alreadyRecoveredForCount
+                        == health.guildMentionCount();
+
+        if (mismatchCount
+                < MENTION_MISMATCHES_BEFORE_RECOVERY
+                || recoveryAlreadyAttempted) {
+
+            return inspection.observations();
+        }
+
+        recoveredMentionCounts.put(
+                server,
+                health.guildMentionCount()
+        );
+
+        return recoverServerAndInspect(
+                inspector,
+                server,
+                "Discord muestra "
+                        + health.guildMentionCount()
+                        + " mención(es), pero la barra lateral "
+                        + "no expuso ningún canal mencionado."
+        );
+    }
+
+    private List<ChannelObservation> recoverServerAndInspect(
+            DiscordDomInspector inspector,
+            ServerType server,
+            String reason
+    ) {
+        long now = System.currentTimeMillis();
+
+        long nextAllowedRecovery =
+                nextServerRecoveryAtMillis.getOrDefault(
+                        server,
+                        0L
+                );
+
+        if (now < nextAllowedRecovery) {
+            return List.of();
+        }
+
+        nextServerRecoveryAtMillis.put(
+                server,
+                now + SERVER_RECOVERY_COOLDOWN_MILLIS
+        );
+
+        notifyStatus(
+                BrowserConnectionState.RECOVERING,
+                "Reconectando "
+                        + server.displayName()
+                        + ": "
+                        + reason
+        );
+
+        try {
+            var replacementPage =
+                    browserSession.replacePage(server);
+
+            structuralFailureCounts.put(server, 0);
+            mentionMismatchCounts.put(server, 0);
+
+            DiscordPageInspection recoveredInspection =
+                    inspector.inspect(
+                            replacementPage,
+                            server,
+                            browserSession.expectedGuildId(server)
+                    );
+
+            notifyStatus(
+                    BrowserConnectionState.READY,
+                    server.displayName()
+                            + " fue reconectado automáticamente."
+            );
+
+            return recoveredInspection.observations();
+
+        } catch (RuntimeException exception) {
+            notifyStatus(
+                    BrowserConnectionState.ERROR,
+                    "No fue posible reconectar "
+                            + server.displayName()
+                            + ": "
+                            + readableMessage(exception)
+            );
+
+            throw exception;
+        }
+    }
+
+    public CompletableFuture<Void> reconnectServer(
+            ServerType server
+    ) {
+        Objects.requireNonNull(
+                server,
+                "El servidor es obligatorio."
+        );
+
+        return CompletableFuture.runAsync(() -> {
+            ensureNotClosed();
+            ensureBrowserAvailable();
+
+            notifyStatus(
+                    BrowserConnectionState.RECOVERING,
+                    "Renovando la pestaña de "
+                            + server.displayName()
+            );
+
+            browserSession.replacePage(server);
+
+            resetServerDiagnostics(server);
+
+            notifyStatus(
+                    BrowserConnectionState.READY,
+                    server.displayName()
+                            + " quedó listo nuevamente."
+            );
+        }, executor);
+    }
+
+    public CompletableFuture<Void> reconnectAll() {
+        return CompletableFuture.runAsync(() -> {
+            ensureNotClosed();
+            ensureBrowserAvailable();
+
+            notifyStatus(
+                    BrowserConnectionState.RECOVERING,
+                    "Reconectando las pestañas de Discord."
+            );
+
+            browserSession.replacePage(
+                    ServerType.SKYBLOCK_MANIACS
+            );
+
+            browserSession.replacePage(
+                    ServerType.KUUDRA_GANG
+            );
+
+            resetServerDiagnostics(
+                    ServerType.SKYBLOCK_MANIACS
+            );
+
+            resetServerDiagnostics(
+                    ServerType.KUUDRA_GANG
+            );
+
+            notifyStatus(
+                    BrowserConnectionState.READY,
+                    "Las pestañas de Discord fueron reconectadas."
+            );
+        }, executor);
+    }
+
+    private void resetServerDiagnostics(ServerType server) {
+        structuralFailureCounts.remove(server);
+        mentionMismatchCounts.remove(server);
+        recoveredMentionCounts.remove(server);
+        nextServerRecoveryAtMillis.remove(server);
     }
 }
